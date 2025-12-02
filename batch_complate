@@ -1,0 +1,421 @@
+#!/bin/bash
+#############################################
+# COMPLETE BATCH NUMBER SYSTEM INSTALLER
+# All-in-One: Database + Backend + Services
+# CT 101 Debian 12 (192.168.1.15)
+#############################################
+
+set -e
+PROJECT_DIR="/opt/batch-number-system"
+DB_NAME="batch_number_db"
+DB_USER="batch_admin"
+DB_PASSWORD="Batch@2025#Secure"
+SERVER_IP="192.168.1.15"
+
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+print_banner() {
+    clear
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗
+║     🏭 BATCH NUMBER SYSTEM - COMPLETE INSTALLER 🏭        ║
+║           Produksi1 Bolang - PT. Camiloplas                 ║
+╚════════════════════════════════════════════════════════════╝${NC}"
+}
+
+print_success() { echo -e "${GREEN}✓ $1${NC}"; }
+print_error() { echo -e "${RED}✗ $1${NC}"; }
+print_info() { echo -e "${YELLOW}→ $1${NC}"; }
+
+# Check root
+[ "$EUID" -ne 0 ] && { print_error "Run as root: sudo bash $0"; exit 1; }
+
+print_banner
+echo -e "\nComponents: PostgreSQL 16 | FastAPI | MQTT | Nginx"
+echo "Estimated time: 15-20 minutes"
+read -p "Press ENTER to continue..."
+
+START_TIME=$(date +%s)
+
+###########################
+# PHASE 1: SYSTEM PREP
+###########################
+echo -e "\n${CYAN}━━━ PHASE 1: SYSTEM PREPARATION ━━━${NC}"
+
+print_info "Updating system..."
+apt update -qq && apt upgrade -y -qq
+print_success "System updated"
+
+print_info "Installing packages..."
+apt install -y -qq curl wget git vim nano htop net-tools build-essential \
+    python3 python3-pip python3-venv python3-dev postgresql-common \
+    redis-server mosquitto mosquitto-clients nginx libpq-dev
+print_success "Packages installed"
+
+print_info "Installing PostgreSQL 16..."
+/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null 2>&1
+apt install -y -qq postgresql-16 postgresql-contrib-16
+systemctl enable --now postgresql redis-server mosquitto nginx
+print_success "PostgreSQL 16 installed"
+
+print_info "Installing Node.js 20..."
+if ! command -v node &>/dev/null; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+    apt install -y -qq nodejs
+fi
+print_success "Node.js $(node --version) installed"
+
+mkdir -p $PROJECT_DIR/{backend,frontend,config,logs,backups,scripts}
+chmod -R 755 $PROJECT_DIR
+print_success "Project structure created"
+
+###########################
+# PHASE 2: DATABASE
+###########################
+echo -e "\n${CYAN}━━━ PHASE 2: DATABASE SETUP ━━━${NC}"
+
+sudo -u postgres psql <<EOF >/dev/null 2>&1
+DROP DATABASE IF EXISTS $DB_NAME;
+DROP USER IF EXISTS $DB_USER;
+CREATE USER $DB_USER WITH PASSWORD '$DB_PASSWORD';
+CREATE DATABASE $DB_NAME OWNER $DB_USER;
+GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;
+\c $DB_NAME
+GRANT ALL ON SCHEMA public TO $DB_USER;
+ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO $DB_USER;
+ALTER DEFAULT PRIVILEGES GRANT ALL ON SEQUENCES TO $DB_USER;
+EOF
+print_success "Database created: $DB_NAME"
+
+# Schema
+PGPASSWORD=$DB_PASSWORD psql -h localhost -U $DB_USER -d $DB_NAME <<'EOSQL' >/dev/null 2>&1
+CREATE TABLE master_product (
+    id SERIAL PRIMARY KEY, no INT GENERATED ALWAYS AS IDENTITY,
+    nama_product VARCHAR(200), ukuran_roll VARCHAR(100),
+    jumlah_roll_terproduksi INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(nama_product, ukuran_roll)
+);
+CREATE TABLE rencana_produksi (
+    id SERIAL PRIMARY KEY, no INT GENERATED ALWAYS AS IDENTITY,
+    production_plan VARCHAR(100), work_order VARCHAR(100),
+    permintaan_pp DECIMAL(10,2), nama_product VARCHAR(200),
+    ukuran_roll VARCHAR(100), no_lot_product VARCHAR(50),
+    no_urut_roll VARCHAR(10) UNIQUE, minta_no_roll BOOLEAN DEFAULT FALSE,
+    waktu_input TIMESTAMP DEFAULT NOW(), code128_lot_number TEXT,
+    status_memproduksi VARCHAR(20) DEFAULT 'pending',
+    nama_admin VARCHAR(100), nama_operator VARCHAR(100),
+    waktu_menimbang TIMESTAMP, berat_product DECIMAL(10,3),
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE,
+    password_hash VARCHAR(255), full_name VARCHAR(100),
+    role VARCHAR(20), is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+INSERT INTO users VALUES (DEFAULT,'admin','$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYzpLhRcQRi','Administrator','admin',true,NOW());
+INSERT INTO master_product (nama_product,ukuran_roll) VALUES
+('LID BENTO LOLIPOP','022 X 660 MM'),
+('Cup PP Oval 16oz Polos 7gr','PP Natural 1.24 x 710'),
+('Blister PP Max love burger','PP NATURAL 0,51 x 700');
+EOSQL
+print_success "Schema imported"
+
+cat > $PROJECT_DIR/config/.env <<EOF
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+MQTT_BROKER=localhost
+MQTT_PORT=1883
+SECRET_KEY=$(openssl rand -hex 32)
+EOF
+chmod 600 $PROJECT_DIR/config/.env
+print_success "Config saved"
+
+###########################
+# PHASE 3: BACKEND
+###########################
+echo -e "\n${CYAN}━━━ PHASE 3: BACKEND INSTALLATION ━━━${NC}"
+
+cd $PROJECT_DIR/backend
+python3 -m venv venv
+source venv/bin/activate
+
+pip install -q --upgrade pip
+pip install -q fastapi==0.109.0 uvicorn[standard]==0.27.0 \
+    psycopg2-binary==2.9.9 paho-mqtt==1.6.1 python-multipart==0.0.6 \
+    python-jose[cryptography]==3.3.0 passlib[bcrypt]==1.7.4 \
+    python-dotenv==1.0.0 pydantic==2.5.3
+print_success "Python dependencies installed"
+
+# Create backend files
+cat > main.py <<'PY'
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from api import router
+from database import init_db
+
+app = FastAPI(title="Batch Number API", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.include_router(router, prefix="/api")
+
+@app.on_event("startup")
+def startup(): init_db()
+
+@app.get("/")
+def root(): return {"message": "Batch Number API", "version": "1.0.0", "status": "running"}
+
+@app.get("/health")
+def health(): return {"status": "healthy"}
+PY
+
+cat > database.py <<'PY'
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
+from dotenv import load_dotenv
+import os
+
+load_dotenv('/opt/batch-number-system/config/.env')
+DB_CONFIG = {"host": os.getenv("DB_HOST"), "port": 5432, "database": os.getenv("DB_NAME"), "user": os.getenv("DB_USER"), "password": os.getenv("DB_PASSWORD")}
+
+@contextmanager
+def get_db_connection():
+    conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
+    try:
+        yield conn
+        conn.commit()
+    except: conn.rollback(); raise
+    finally: conn.close()
+
+def init_db():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+
+def generate_no_urut_roll(nama_product, ukuran_roll, conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT jumlah_roll_terproduksi FROM master_product WHERE nama_product=%s AND ukuran_roll=%s FOR UPDATE", (nama_product, ukuran_roll))
+    result = cursor.fetchone()
+    if not result:
+        cursor.execute("INSERT INTO master_product (nama_product,ukuran_roll,jumlah_roll_terproduksi) VALUES (%s,%s,0) RETURNING jumlah_roll_terproduksi", (nama_product, ukuran_roll))
+        current_count = 0
+    else:
+        current_count = result['jumlah_roll_terproduksi']
+    new_count = current_count + 1
+    no_urut_roll = str(new_count).zfill(5)
+    cursor.execute("UPDATE master_product SET jumlah_roll_terproduksi=%s WHERE nama_product=%s AND ukuran_roll=%s", (new_count, nama_product, ukuran_roll))
+    conn.commit()
+    return no_urut_roll
+PY
+
+cat > models.py <<'PY'
+from pydantic import BaseModel, Field
+from typing import Optional
+from datetime import datetime
+
+class RencanaInput(BaseModel):
+    production_plan: str; work_order: str; permintaan_pp: float
+    nama_product: str; ukuran_roll: str
+    no_lot_product: str = Field(..., min_length=17, max_length=17)
+    nama_admin: str; nama_operator: str
+
+class RollNumberResponse(BaseModel):
+    id: int; no_urut_roll: str; code128_lot_number: str
+    waktu_input: str; nama_product: str; ukuran_roll: str
+
+class ScanBarcodeInput(BaseModel):
+    code128_lot_number: str; berat_product: float
+PY
+
+cat > mqtt_client.py <<'PY'
+import paho.mqtt.client as mqtt
+import os
+mqtt_client = mqtt.Client()
+try:
+    mqtt_client.connect(os.getenv("MQTT_BROKER", "localhost"), 1883, 60)
+    mqtt_client.loop_start()
+except: pass
+
+def publish_print_command(code128, product, size):
+    zpl = f"^XA^FO50,30^A0N,40^FDBATCH BOLANG^FS^FO50,80^BY3^BCN,100,Y,N,N^FD{code128}^FS^FO50,200^A0N,30^FD{product}^FS^FO50,240^A0N,25^FD{size}^FS^XZ"
+    mqtt_client.publish("printer/zebra", zpl)
+PY
+
+cat > api.py <<'PY'
+from fastapi import APIRouter, HTTPException
+from datetime import datetime
+from models import *
+from database import get_db_connection, generate_no_urut_roll
+from mqtt_client import publish_print_command
+
+router = APIRouter()
+
+@router.post("/request-roll-number", response_model=RollNumberResponse)
+def request_roll_number(data: RencanaInput):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        no_urut_roll = generate_no_urut_roll(data.nama_product, data.ukuran_roll, conn)
+        waktu_input = datetime.now()
+        code128 = f"{data.no_lot_product}-{no_urut_roll} {data.nama_product} {data.ukuran_roll} {waktu_input.strftime('%H:%M-%d/%m/%y')}-{data.nama_admin}-{data.nama_operator}"
+        cursor.execute("INSERT INTO rencana_produksi (production_plan,work_order,permintaan_pp,nama_product,ukuran_roll,no_lot_product,no_urut_roll,minta_no_roll,waktu_input,code128_lot_number,nama_admin,nama_operator,status_memproduksi) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id", 
+            (data.production_plan,data.work_order,data.permintaan_pp,data.nama_product,data.ukuran_roll,data.no_lot_product,no_urut_roll,True,waktu_input,code128,data.nama_admin,data.nama_operator,'pending'))
+        result = cursor.fetchone()
+        publish_print_command(code128, data.nama_product, data.ukuran_roll)
+        return {"id":result['id'],"no_urut_roll":no_urut_roll,"code128_lot_number":code128,"waktu_input":waktu_input.strftime('%H:%M:%S-%d/%m/%y'),"nama_product":data.nama_product,"ukuran_roll":data.ukuran_roll}
+
+@router.post("/scan-barcode")
+def scan_barcode(data: ScanBarcodeInput):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE rencana_produksi SET status_memproduksi='terproduksi', berat_product=%s, waktu_menimbang=%s WHERE code128_lot_number=%s RETURNING id,nama_product,ukuran_roll", 
+            (data.berat_product, datetime.now(), data.code128_lot_number))
+        result = cursor.fetchone()
+        if not result: raise HTTPException(404, "Barcode not found")
+        publish_print_command(data.code128_lot_number, result['nama_product'], f"{result['ukuran_roll']} - {data.berat_product}KG")
+        return {"status":"success","data":dict(result)}
+
+@router.get("/master-product")
+def get_master_product():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM master_product ORDER BY nama_product")
+        return {"data":[dict(r) for r in cursor.fetchall()]}
+
+@router.get("/rencana-produksi")
+def get_rencana(limit: int = 100):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM rencana_produksi ORDER BY waktu_input DESC LIMIT %s", (limit,))
+        return {"data":[dict(r) for r in cursor.fetchall()]}
+
+@router.get("/dashboard-stats")
+def get_stats():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as t FROM master_product"); total_products = cursor.fetchone()['t']
+        cursor.execute("SELECT COUNT(*) as t FROM rencana_produksi WHERE DATE(waktu_input)=CURRENT_DATE"); today = cursor.fetchone()['t']
+        cursor.execute("SELECT COUNT(*) as t FROM rencana_produksi WHERE status_memproduksi='pending'"); pending = cursor.fetchone()['t']
+        cursor.execute("SELECT SUM(jumlah_roll_terproduksi) as t FROM master_product"); total_rolls = cursor.fetchone()['t'] or 0
+        return {"total_products":total_products,"today_production":today,"pending":pending,"total_rolls":total_rolls}
+PY
+
+print_success "Backend code created"
+
+###########################
+# PHASE 4: SERVICES
+###########################
+echo -e "\n${CYAN}━━━ PHASE 4: SERVICES SETUP ━━━${NC}"
+
+cat > /etc/systemd/system/batch-api.service <<EOF
+[Unit]
+Description=Batch Number API
+After=network.target postgresql.service
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$PROJECT_DIR/backend
+Environment="PATH=$PROJECT_DIR/backend/venv/bin"
+ExecStart=$PROJECT_DIR/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+Restart=always
+RestartSec=10
+StandardOutput=append:$PROJECT_DIR/logs/api.log
+StandardError=append:$PROJECT_DIR/logs/api-error.log
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable batch-api
+systemctl start batch-api
+sleep 3
+systemctl is-active --quiet batch-api && print_success "API service running" || { print_error "API failed"; exit 1; }
+
+# Nginx
+cat > /etc/nginx/sites-available/batch-system <<EOF
+server {
+    listen 80; server_name $SERVER_IP;
+    location /api/ { proxy_pass http://localhost:8000/api/; proxy_set_header Host \$host; }
+    location /docs { proxy_pass http://localhost:8000/docs; }
+    location ~ ^/(health|openapi.json) { proxy_pass http://localhost:8000; }
+}
+EOF
+ln -sf /etc/nginx/sites-available/batch-system /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl reload nginx
+print_success "Nginx configured"
+
+# Scripts
+cat > $PROJECT_DIR/scripts/test_api.sh <<'EOF'
+#!/bin/bash
+echo "Testing API..."
+curl -s http://192.168.1.5:8000/health | grep -q healthy && echo "✓ Health: OK" || echo "✗ Health: FAIL"
+curl -s http://192.168.1.5:8000/api/master-product | jq -r '.data | length' | xargs echo "✓ Master products:"
+curl -s http://192.168.1.5:8000/api/dashboard-stats | jq '.'
+EOF
+chmod +x $PROJECT_DIR/scripts/test_api.sh
+
+cat > /usr/local/bin/batch <<'EOF'
+#!/bin/bash
+case "$1" in
+  status) systemctl status batch-api;;
+  start) systemctl start batch-api;;
+  stop) systemctl stop batch-api;;
+  restart) systemctl restart batch-api;;
+  logs) journalctl -u batch-api -f;;
+  test) /opt/batch-number-system/scripts/test_api.sh;;
+  *) echo "Usage: batch {status|start|stop|restart|logs|test}";;
+esac
+EOF
+chmod +x /usr/local/bin/batch
+print_success "Quick commands installed"
+
+###########################
+# FINAL
+###########################
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+print_banner
+echo -e "\n${GREEN}╔════════════════════════════════════════════════════════════╗
+║               ✓ INSTALLATION COMPLETE ✓                   ║
+╚════════════════════════════════════════════════════════════╝${NC}
+
+⏱️  Installation time: $((ELAPSED/60))m $((ELAPSED%60))s
+
+📊 System Information:
+   IP Address:    $SERVER_IP
+   Database:      $DB_NAME
+   DB User:       $DB_USER
+   DB Password:   $DB_PASSWORD
+
+🔐 Admin Credentials:
+   Username:      admin
+   Password:      admin123
+
+🌐 Access URLs:
+   API:           http://$SERVER_IP:8000
+   API Docs:      http://$SERVER_IP:8000/docs
+   Health Check:  http://$SERVER_IP:8000/health
+
+🚀 Quick Commands:
+   batch status   - Check service status
+   batch logs     - View real-time logs
+   batch test     - Test API endpoints
+   batch restart  - Restart API service
+
+📝 Logs Location:
+   $PROJECT_DIR/logs/api.log
+
+✓ Next Steps:
+   1. Test API: batch test
+   2. View docs: http://$SERVER_IP:8000/docs
+   3. Check logs: batch logs
+   4. Setup Raspberry Pi QC Station
+
+${GREEN}Installation completed successfully!${NC}
+"
