@@ -2,7 +2,7 @@
 #############################################
 # COMPLETE BATCH NUMBER SYSTEM INSTALLER
 # All-in-One: Database + Backend + Frontend
-# CT 101 Debian 12 (192.168.1.5)
+# CT 101 Debian 12 (192.168.1.15)
 # RAM: 8GB | SSD: 32GB
 #############################################
 
@@ -35,7 +35,7 @@ print_banner() {
 ║                                                                ║
 ║         🏭  BATCH NUMBER SYSTEM - COMPLETE INSTALLER  🏭       ║
 ║                                                                ║
-║              Produksi1 Bolang - PT. Camiloplas                 ║
+║                     Produksi1 Bolang                           ║
 ║                    CT 101 - 192.168.1.15                       ║
 ║                                                                ║
 ║  Components:                                                   ║
