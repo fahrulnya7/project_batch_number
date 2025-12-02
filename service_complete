@@ -1,0 +1,372 @@
+#!/bin/bash
+#############################################
+# Services Setup and Final Configuration
+# Part of Complete Batch System Installer
+#############################################
+
+PROJECT_DIR="/opt/batch-number-system"
+SERVER_IP="192.168.1.15"
+
+echo "Setting up systemd services..."
+
+#############################################
+# Systemd Service for Backend API
+#############################################
+cat > /etc/systemd/system/batch-api.service <<EOF
+[Unit]
+Description=Batch Number FastAPI Service
+After=network.target postgresql.service mosquitto.service
+Wants=postgresql.service mosquitto.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$PROJECT_DIR/backend
+Environment="PATH=$PROJECT_DIR/backend/venv/bin"
+EnvironmentFile=$PROJECT_DIR/config/.env
+ExecStart=$PROJECT_DIR/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+Restart=always
+RestartSec=10
+StandardOutput=append:$PROJECT_DIR/logs/api.log
+StandardError=append:$PROJECT_DIR/logs/api-error.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "✓ Systemd service created: batch-api.service"
+
+# Enable and start service
+systemctl daemon-reload
+systemctl enable batch-api
+systemctl start batch-api
+
+echo "✓ Service started"
+
+sleep 3
+
+# Check service status
+if systemctl is-active --quiet batch-api; then
+    echo "✓ Backend API is running"
+else
+    echo "✗ Backend API failed to start"
+    journalctl -u batch-api -n 50
+    exit 1
+fi
+
+#############################################
+# Nginx Configuration
+#############################################
+cat > /etc/nginx/sites-available/batch-system <<EOF
+server {
+    listen 80;
+    server_name $SERVER_IP;
+
+    # API Backend
+    location /api/ {
+        proxy_pass http://localhost:8000/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # API Docs
+    location /docs {
+        proxy_pass http://localhost:8000/docs;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+    }
+
+    # API Root
+    location ~ ^/(health|openapi.json) {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+    }
+
+    # Frontend (will be added later)
+    location / {
+        root $PROJECT_DIR/frontend/dist;
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "no-cache, must-revalidate";
+    }
+}
+EOF
+
+# Enable site
+ln -sf /etc/nginx/sites-available/batch-system /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+
+# Test nginx config
+nginx -t
+
+if [ $? -eq 0 ]; then
+    systemctl reload nginx
+    echo "✓ Nginx configured and reloaded"
+else
+    echo "✗ Nginx configuration error"
+    exit 1
+fi
+
+#############################################
+# Create Test Scripts
+#############################################
+cat > $PROJECT_DIR/scripts/test_api.sh <<'ENDTEST'
+#!/bin/bash
+# API Testing Script
+
+API_URL="http://192.168.1.15:8000"
+
+echo "Testing Batch Number API..."
+echo ""
+
+# Test 1: Health Check
+echo "1. Health Check:"
+curl -s $API_URL/health | jq '.'
+echo ""
+
+# Test 2: Get Master Products
+echo "2. Master Products:"
+curl -s $API_URL/api/master-product | jq '.data | length'
+echo " products found"
+echo ""
+
+# Test 3: Dashboard Stats
+echo "3. Dashboard Stats:"
+curl -s $API_URL/api/dashboard-stats | jq '.'
+echo ""
+
+# Test 4: Request Roll Number
+echo "4. Request Roll Number:"
+curl -s -X POST $API_URL/api/request-roll-number \
+  -H "Content-Type: application/json" \
+  -d '{
+    "production_plan": "PP-TEST-001",
+    "work_order": "WO-TEST-001",
+    "permintaan_pp": 1000,
+    "nama_product": "LID BENTO LOLIPOP",
+    "ukuran_roll": "022 X 660 MM",
+    "no_lot_product": "103PPNT02201122501",
+    "nama_admin": "TEST ADMIN",
+    "nama_operator": "TEST OPERATOR"
+  }' | jq '.'
+echo ""
+
+echo "✓ API Tests Completed"
+ENDTEST
+
+chmod +x $PROJECT_DIR/scripts/test_api.sh
+
+#############################################
+# Create Monitoring Script
+#############################################
+cat > $PROJECT_DIR/scripts/monitor.sh <<'ENDMON'
+#!/bin/bash
+# System Monitoring Script
+
+echo "╔════════════════════════════════════════════════════════╗"
+echo "║         BATCH NUMBER SYSTEM - STATUS MONITOR          ║"
+echo "╚════════════════════════════════════════════════════════╝"
+echo ""
+
+# Services Status
+echo "📊 SERVICES STATUS:"
+echo "-----------------------------------------------------------"
+printf "PostgreSQL:  "
+systemctl is-active postgresql && echo "✓ Running" || echo "✗ Stopped"
+printf "Redis:       "
+systemctl is-active redis-server && echo "✓ Running" || echo "✗ Stopped"
+printf "Mosquitto:   "
+systemctl is-active mosquitto && echo "✓ Running" || echo "✗ Stopped"
+printf "Batch API:   "
+systemctl is-active batch-api && echo "✓ Running" || echo "✗ Stopped"
+printf "Nginx:       "
+systemctl is-active nginx && echo "✓ Running" || echo "✗ Stopped"
+echo ""
+
+# Database Stats
+echo "🗄️  DATABASE STATUS:"
+echo "-----------------------------------------------------------"
+DB_STATS=$(sudo -u postgres psql -d batch_number_db -t -c "
+SELECT 
+    (SELECT COUNT(*) FROM master_product) as products,
+    (SELECT COUNT(*) FROM rencana_produksi) as total_rencana,
+    (SELECT COUNT(*) FROM rencana_produksi WHERE status_memproduksi='pending') as pending,
+    (SELECT COUNT(*) FROM rencana_produksi WHERE status_memproduksi='terproduksi') as completed;
+" 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    echo "$DB_STATS" | awk '{
+        print "Master Products: " $1
+        print "Total Rencana:   " $2  
+        print "Pending:         " $3
+        print "Completed:       " $4
+    }'
+else
+    echo "✗ Database connection failed"
+fi
+echo ""
+
+# System Resources
+echo "💻 SYSTEM RESOURCES:"
+echo "-----------------------------------------------------------"
+echo "CPU Usage:    $(top -bn1 | grep "Cpu(s)" | awk '{print $2}')%"
+echo "Memory:       $(free -h | awk '/^Mem:/ {print $3 "/" $2}')"
+echo "Disk:         $(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')"
+echo ""
+
+# Recent Logs
+echo "📝 RECENT API LOGS (Last 5 lines):"
+echo "-----------------------------------------------------------"
+tail -5 /opt/batch-number-system/logs/api.log 2>/dev/null || echo "No logs yet"
+echo ""
+
+# API Health
+echo "🌐 API HEALTH CHECK:"
+echo "-----------------------------------------------------------"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health)
+if [ "$HTTP_CODE" == "200" ]; then
+    echo "✓ API is healthy (HTTP $HTTP_CODE)"
+else
+    echo "✗ API is unhealthy (HTTP $HTTP_CODE)"
+fi
+echo ""
+
+echo "Last updated: $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+ENDMON
+
+chmod +x $PROJECT_DIR/scripts/monitor.sh
+
+#############################################
+# Create Backup Script
+#############################################
+cat > $PROJECT_DIR/scripts/backup.sh <<'ENDBACKUP'
+#!/bin/bash
+# Database Backup Script
+
+DATE=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="/opt/batch-number-system/backups"
+
+mkdir -p $BACKUP_DIR
+
+echo "Starting database backup..."
+
+# Backup PostgreSQL
+sudo -u postgres pg_dump batch_number_db > $BACKUP_DIR/batch_db_$DATE.sql
+
+if [ $? -eq 0 ]; then
+    gzip $BACKUP_DIR/batch_db_$DATE.sql
+    echo "✓ Backup completed: batch_db_$DATE.sql.gz"
+    
+    # Keep only last 30 days
+    find $BACKUP_DIR -name "*.sql.gz" -mtime +30 -delete
+    echo "✓ Old backups cleaned"
+else
+    echo "✗ Backup failed"
+    exit 1
+fi
+
+# Backup size
+du -sh $BACKUP_DIR/batch_db_$DATE.sql.gz
+ENDBACKUP
+
+chmod +x $PROJECT_DIR/scripts/backup.sh
+
+# Add to crontab (daily at 2 AM)
+(crontab -l 2>/dev/null; echo "0 2 * * * /opt/batch-number-system/scripts/backup.sh >> /opt/batch-number-system/logs/backup.log 2>&1") | crontab -
+
+echo "✓ Backup cron job added"
+
+#############################################
+# Create Quick Commands
+#############################################
+cat > /usr/local/bin/batch <<'ENDCMD'
+#!/bin/bash
+# Quick command for batch system management
+
+case "$1" in
+    status)
+        /opt/batch-number-system/scripts/monitor.sh
+        ;;
+    start)
+        systemctl start batch-api
+        echo "✓ Batch API started"
+        ;;
+    stop)
+        systemctl stop batch-api
+        echo "✓ Batch API stopped"
+        ;;
+    restart)
+        systemctl restart batch-api
+        echo "✓ Batch API restarted"
+        ;;
+    logs)
+        journalctl -u batch-api -f
+        ;;
+    test)
+        /opt/batch-number-system/scripts/test_api.sh
+        ;;
+    backup)
+        /opt/batch-number-system/scripts/backup.sh
+        ;;
+    *)
+        echo "Batch Number System - Quick Commands"
+        echo ""
+        echo "Usage: batch [command]"
+        echo ""
+        echo "Commands:"
+        echo "  status   - Show system status"
+        echo "  start    - Start API service"
+        echo "  stop     - Stop API service"
+        echo "  restart  - Restart API service"
+        echo "  logs     - View API logs (real-time)"
+        echo "  test     - Run API tests"
+        echo "  backup   - Backup database"
+        echo ""
+        ;;
+esac
+ENDCMD
+
+chmod +x /usr/local/bin/batch
+
+echo "✓ Quick command 'batch' installed"
+
+#############################################
+# Final Verification
+#############################################
+echo ""
+echo "Running final verification..."
+sleep 2
+
+# Test API
+API_TEST=$(curl -s http://localhost:8000/health)
+if echo "$API_TEST" | grep -q "healthy"; then
+    echo "✓ API Health Check: PASS"
+else
+    echo "✗ API Health Check: FAIL"
+fi
+
+# Test Database
+DB_TEST=$(sudo -u postgres psql -d batch_number_db -t -c "SELECT COUNT(*) FROM master_product;" 2>/dev/null)
+if [ $? -eq 0 ]; then
+    echo "✓ Database Connection: PASS ($DB_TEST products)"
+else
+    echo "✗ Database Connection: FAIL"
+fi
+
+# Test MQTT
+MQTT_TEST=$(mosquitto_pub -h localhost -t test -m "test" 2>&1)
+if [ $? -eq 0 ]; then
+    echo "✓ MQTT Broker: PASS"
+else
+    echo "✗ MQTT Broker: FAIL"
+fi
+
+echo ""
+echo "✓ All services configured and running!"
